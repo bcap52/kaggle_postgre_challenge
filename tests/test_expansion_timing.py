@@ -125,24 +125,23 @@ class ExpansionTimingTests(unittest.TestCase):
         ]
 
         with (
-            patch.object(service, "table_exists", return_value=True),
             patch.object(
                 service,
-                "get_table_column_definitions",
-                return_value=[
-                    {"name": "raw_schema", "type": "text"},
-                    {"name": "raw_hash", "type": "text"},
-                ],
+                "_run_consolidated_expansion_preflight",
+                return_value={
+                    "source_exists": True,
+                    "source_columns": [
+                        {"name": "raw_schema", "type": "text"},
+                        {"name": "raw_hash", "type": "text"},
+                    ],
+                    "destination_row_counts": {"public.table1": 0},
+                },
             ),
             patch.object(
                 service,
                 "get_raw_schema_version_references",
                 return_value=[{"raw_schema": "group001"}],
             ),
-            patch.object(service, "_validate_cross_table_expansion_functions"),
-            patch.object(service, "ensure_data_database_metadata"),
-            patch.object(service, "get_table_row_count", return_value=0),
-            patch.object(service, "_validate_managed_sql_dependencies"),
             patch.object(service, "run_remote_command", side_effect=fake_remote_command),
         ):
             result = service.execute_cross_table_expansion(

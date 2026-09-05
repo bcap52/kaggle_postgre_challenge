@@ -12586,20 +12586,9 @@ END
             "contains_delete": "delete" in commands,
         }
 
-    def _validate_managed_sql_dependencies(
-        self,
-        database_name: str,
-        full_table_name: str,
-        commands: set[str],
-        delete_relationship_acknowledged: bool = False,
-        cancel_event=None,
-    ):
-        dml_commands = commands & {"insert", "update", "delete", "truncate"}
-        if not dml_commands:
-            return
-
-        schema_name, table_name = split_table_name(full_table_name)
-        sql = f"""
+    @staticmethod
+    def _managed_dependency_payload_sql(schema_name: str, table_name: str) -> str:
+        return f"""
 SELECT json_build_object(
     'relation_kind', target.relkind,
     'is_partition', target.relispartition,
@@ -12671,6 +12660,21 @@ JOIN pg_namespace AS target_namespace ON target_namespace.oid = target.relnamesp
 WHERE target_namespace.nspname = {sql_literal(schema_name)}
   AND target.relname = {sql_literal(table_name)};
 """
+
+    def _validate_managed_sql_dependencies(
+        self,
+        database_name: str,
+        full_table_name: str,
+        commands: set[str],
+        delete_relationship_acknowledged: bool = False,
+        cancel_event=None,
+    ):
+        dml_commands = commands & {"insert", "update", "delete", "truncate"}
+        if not dml_commands:
+            return
+
+        schema_name, table_name = split_table_name(full_table_name)
+        sql = self._managed_dependency_payload_sql(schema_name, table_name)
         command = (
             f"psql -h localhost -U {shlex.quote(self.sql_username)} "
             f"-d {shlex.quote(database_name)} -X -At -v ON_ERROR_STOP=1 -c {shlex.quote(sql)}"
@@ -12680,6 +12684,22 @@ WHERE target_namespace.nspname = {sql_literal(schema_name)}
             raise RuntimeError(f"A tabela selecionada {schema_name}.{table_name} nao existe.")
 
         metadata = json.loads(output.splitlines()[-1])
+        self._validate_dependency_metadata(
+            metadata,
+            dml_commands,
+            schema_name,
+            table_name,
+            delete_relationship_acknowledged=delete_relationship_acknowledged,
+        )
+
+    def _validate_dependency_metadata(
+        self,
+        metadata,
+        dml_commands,
+        schema_name: str,
+        table_name: str,
+        delete_relationship_acknowledged: bool = False,
+    ):
         if metadata.get("relation_kind") != "r" or metadata.get("is_partition"):
             raise RuntimeError(
                 "O contador automatico do botao SQL aceita alteracao de linhas apenas em tabelas comuns, "
@@ -13584,12 +13604,7 @@ WHERE database_name = {sql_literal(database_name)}
             "IN SHARE ROW EXCLUSIVE MODE;"
         )
 
-    def _validate_cross_table_expansion_functions(
-        self,
-        database_name: str,
-        destinations,
-        cancel_event=None,
-    ):
+    def _build_function_candidate_sql(self, destinations) -> str | None:
         function_references = []
         for destination in destinations or []:
             for reference in destination.get("function_references") or []:
@@ -13603,7 +13618,7 @@ WHERE database_name = {sql_literal(database_name)}
                 ):
                     function_references.append(normalized_reference)
         if not function_references:
-            return
+            return None
 
         values_sql = ",\n".join(
             (
@@ -13614,7 +13629,7 @@ WHERE database_name = {sql_literal(database_name)}
             )
             for schema_name, function_name in function_references
         )
-        sql = f"""
+        return f"""
 WITH requested(function_schema, function_name) AS (
     VALUES
     {values_sql}
@@ -13656,15 +13671,8 @@ SELECT COALESCE(
 )::text
 FROM requested;
 """
-        command = (
-            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
-            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
-            f"-c {shlex.quote(sql)}"
-        )
-        output = self.run_remote_command(
-            command,
-            cancel_event=cancel_event,
-        ).strip()
+
+    def _validate_function_candidate_metadata(self, output: str) -> None:
         try:
             function_metadata = json.loads(output.splitlines()[-1] if output else "[]")
         except json.JSONDecodeError as exc:
@@ -13706,6 +13714,176 @@ FROM requested;
                 "data outside the protected source:\n- "
                 + "\n- ".join(problems)
             )
+
+    def _validate_cross_table_expansion_functions(
+        self,
+        database_name: str,
+        destinations,
+        cancel_event=None,
+    ):
+        sql = self._build_function_candidate_sql(destinations)
+        if sql is None:
+            return
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        output = self.run_remote_command(
+            command,
+            cancel_event=cancel_event,
+        ).strip()
+        self._validate_function_candidate_metadata(output)
+
+    def _run_consolidated_expansion_preflight(
+        self,
+        database_name: str,
+        source_schema_name: str,
+        source_table_name: str,
+        destinations,
+        cancel_event=None,
+    ) -> dict:
+        """Run every preflight inspection in one remote psql script.
+
+        Performs the same checks as the individual preflight commands (source
+        existence and columns, SQL function safety, managed dependency
+        validation, row counters) while paying the psql startup cost once.
+        """
+        function_candidate_sql = self._build_function_candidate_sql(destinations)
+
+        source_columns_sql = f"""
+    COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'name', attribute.attname,
+                'type', pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+            )
+            ORDER BY attribute.attnum
+        )
+        FROM pg_attribute AS attribute
+        JOIN pg_class AS relation
+          ON relation.oid = attribute.attrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = {sql_literal(source_schema_name)}
+          AND relation.relname = {sql_literal(source_table_name)}
+          AND relation.relkind IN ('r', 'p')
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+    ), '[]'::json)
+"""
+
+        destination_blocks = []
+        for index, destination in enumerate(destinations):
+            schema_name = str(destination.get("schema_name") or "").strip()
+            table_name = str(destination.get("pure_table_name") or "").strip()
+            payload_sql = self._managed_dependency_payload_sql(
+                "__pgdm_schema__", "__pgdm_table__"
+            )
+            payload_sql = payload_sql.replace(
+                sql_literal("__pgdm_schema__"), sql_literal(schema_name)
+            ).replace(
+                sql_literal("__pgdm_table__"), sql_literal(table_name)
+            )
+            payload_sql = payload_sql.strip().rstrip(";").strip()
+            destination_blocks.append(
+                f"""
+SELECT json_build_object(
+    'preflight', 'destination',
+    'index', {index},
+    'payload', ({payload_sql}),
+    'counter', COALESCE((
+        SELECT row_count
+        FROM {DATA_TABLE_ROW_COUNTS}
+        WHERE schema_name = {sql_literal(schema_name)}
+          AND table_name = {sql_literal(table_name)}
+    ), -1)
+)::text;
+""".strip()
+            )
+
+        function_statement = ""
+        if function_candidate_sql is not None:
+            function_statement = "\n" + function_candidate_sql + ";"
+
+        script = (
+            "SET client_min_messages = warning;\n"
+            "BEGIN;\n"
+            + self._data_table_row_counts_ddl_sql()
+            + "\nCOMMIT;\n\n"
+            f"""
+SELECT json_build_object(
+    'preflight', 'source',
+    'exists', (to_regclass({sql_literal(f"{source_schema_name}.{source_table_name}")}) IS NOT NULL),
+    'columns', {source_columns_sql}
+)::text;
+""".strip()
+            + function_statement
+            + "\n\n"
+            + "\n\n".join(destination_blocks)
+        )
+
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 -f -"
+        )
+        dump_path = os.getenv("PDM_PREFLIGHT_DUMP_SQL")
+        if dump_path:
+            try:
+                Path(dump_path).write_text(script, encoding="utf-8")
+            except OSError:
+                pass
+        output = self.run_remote_command(
+            command,
+            stdin_text=script,
+            cancel_event=cancel_event,
+        )
+
+        result = {
+            "source_exists": False,
+            "source_columns": [],
+            "destination_row_counts": {},
+        }
+        for line in output.splitlines():
+            candidate = line.strip()
+            if candidate.startswith("["):
+                self._validate_function_candidate_metadata(candidate)
+                continue
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("preflight")
+            if kind == "source":
+                result["source_exists"] = bool(payload.get("exists"))
+                result["source_columns"] = list(payload.get("columns") or [])
+            elif kind == "destination":
+                index = int(payload.get("index"))
+                metadata = payload.get("payload")
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except json.JSONDecodeError:
+                        metadata = None
+                if not isinstance(metadata, dict) or not metadata:
+                    destination_name = destinations[index]["table_name"]
+                    raise RuntimeError(
+                        f"Destination table {destination_name} does not exist."
+                    )
+                self._validate_dependency_metadata(
+                    metadata,
+                    {"insert"},
+                    destinations[index]["schema_name"],
+                    destinations[index]["pure_table_name"],
+                )
+                result["destination_row_counts"][
+                    destinations[index]["table_name"]
+                ] = int(payload.get("counter"))
+        return result
 
     def _resolve_optimized_statement(
         self,
@@ -14018,31 +14196,23 @@ SELECT json_build_object(
         with self.expansion_timing_scope(
             timing_report,
             "preflight",
-            "Verify source table existence",
+            "Consolidated preflight validation",
         ):
-            source_exists = self.table_exists(
+            preflight = self._run_consolidated_expansion_preflight(
                 database_name,
-                source_full_table_name,
+                source_schema_name,
+                source_table_name,
+                prepared["destinations"],
                 cancel_event=cancel_event,
             )
-        if not source_exists:
+        if not preflight["source_exists"]:
             raise RuntimeError(
                 f"Source table {source_full_table_name} does not exist."
             )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Read and validate source column metadata",
-        ):
-            source_column_definitions = self.get_table_column_definitions(
-                database_name,
-                source_full_table_name,
-                cancel_event=cancel_event,
-            )
-            source_columns = {
-                item["name"]: item["type"] for item in source_column_definitions
-            }
+        source_column_definitions = preflight["source_columns"]
+        source_columns = {
+            item["name"]: item["type"] for item in source_column_definitions
+        }
         missing_source_columns = [
             column_name
             for column_name in ("raw_schema", "raw_hash")
@@ -14083,62 +14253,7 @@ SELECT json_build_object(
                 + "."
             )
 
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Validate SQL function safety",
-        ):
-            self._validate_cross_table_expansion_functions(
-                database_name,
-                prepared["destinations"],
-                cancel_event=cancel_event,
-            )
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Ensure data-database metadata and row counters",
-        ):
-            self.ensure_data_database_metadata(
-                database_name,
-                cancel_event=cancel_event,
-            )
-        for destination in prepared["destinations"]:
-            full_table_name = destination["table_name"]
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Verify destination {full_table_name}",
-            ):
-                destination_exists = self.table_exists(
-                    database_name,
-                    full_table_name,
-                    cancel_event=cancel_event,
-                )
-            if not destination_exists:
-                raise RuntimeError(
-                    f"Destination table {full_table_name} does not exist."
-                )
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Read row counter for {full_table_name}",
-            ):
-                destination_row_counts[full_table_name] = self.get_table_row_count(
-                    database_name,
-                    full_table_name,
-                    cancel_event=cancel_event,
-                )
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Validate managed dependencies for {full_table_name}",
-            ):
-                self._validate_managed_sql_dependencies(
-                    database_name,
-                    full_table_name,
-                    {"insert"},
-                    cancel_event=cancel_event,
-                )
+        destination_row_counts = dict(preflight["destination_row_counts"])
 
         self._notify_progress(
             progress_callback,
