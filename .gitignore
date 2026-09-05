@@ -34,3 +34,7 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+# benchmark artifacts
+benchmarks/results/
+profiles/

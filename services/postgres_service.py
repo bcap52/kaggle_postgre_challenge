@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import sys
@@ -15,6 +16,15 @@ from datetime import datetime
 from pathlib import Path
 
 import paramiko
+
+from services.expansion_optimizer import (
+    OptimizedExpansionPlan,
+    build_optimized_manifest_sql,
+    build_staging_cleanup_sql,
+    build_staging_union,
+    plan_optimized_expansion,
+    run_staging_phase,
+)
 import pandas as pd
 
 from config import (
@@ -291,6 +301,9 @@ class PostgresAdminService:
         self._active_channels = set()
         self._active_channels_lock = threading.Lock()
         self._data_metadata_ready_databases = set()
+        self.expansion_fastpath_enabled = os.getenv(
+            "PDM_EXPANSION_FASTPATH", "1"
+        ).strip() != "0"
         self._data_metadata_lock = threading.Lock()
         self._expansion_timing_local = threading.local()
 
@@ -13694,6 +13707,186 @@ FROM requested;
                 + "\n- ".join(problems)
             )
 
+    def _resolve_optimized_statement(
+        self,
+        plan: OptimizedExpansionPlan,
+        destination,
+        statement_index: int,
+        staging_partitions: list[str],
+    ) -> str:
+        rewritten_statement = None
+        for optimized in plan.statements:
+            if (
+                optimized.destination_index == destination.get("_plan_index")
+                and optimized.statement_index == statement_index
+            ):
+                rewritten_statement = optimized.rewritten
+                break
+        if rewritten_statement is None:
+            raise RuntimeError(
+                "The optimized expansion plan is missing a rewritten statement "
+                f"for {destination['table_name']} (statement {statement_index})."
+            )
+        source_sql = build_staging_union(plan, staging_partitions)
+        placeholder = self.CROSS_TABLE_SOURCE_PLACEHOLDER
+        return rewritten_statement.replace(placeholder, source_sql)
+
+    def _fetch_destination_constraint_catalog(
+        self,
+        database_name: str,
+        destinations,
+        cancel_event=None,
+    ) -> dict:
+        """Catalog of FK/unique constraints and secondary indexes per destination."""
+        targets = []
+        for index, destination in enumerate(destinations):
+            schema_name = str(destination.get("schema_name") or "").strip()
+            table_name = str(destination.get("pure_table_name") or "").strip()
+            if not schema_name or not table_name:
+                continue
+            targets.append((index, schema_name, table_name))
+        if not targets:
+            return {}
+        values_sql = ", ".join(
+            f"({index}, {sql_literal(schema_name)}, {sql_literal(table_name)})"
+            for index, schema_name, table_name in targets
+        )
+        sql = f"""
+WITH requested(index_number, schema_name, table_name) AS (
+    VALUES
+    {values_sql}
+)
+SELECT COALESCE(json_object_agg(
+    requested.index_number::text,
+    json_build_object(
+        'schema_name', requested.schema_name,
+        'table_name', requested.table_name,
+        'relation_kind', target.relkind,
+        'foreign_keys', COALESCE((
+            SELECT json_agg(
+                json_build_object('name', constraint_data.conname, 'def', pg_get_constraintdef(constraint_data.oid))
+                ORDER BY constraint_data.conname
+            )
+            FROM pg_constraint AS constraint_data
+            WHERE constraint_data.conrelid = target.oid
+              AND constraint_data.contype = 'f'
+        ), '[]'::json),
+        'unique_constraints', COALESCE((
+            SELECT json_agg(
+                json_build_object('name', constraint_data.conname, 'def', pg_get_constraintdef(constraint_data.oid))
+                ORDER BY constraint_data.conname
+            )
+            FROM pg_constraint AS constraint_data
+            WHERE constraint_data.conrelid = target.oid
+              AND constraint_data.contype = 'u'
+        ), '[]'::json),
+        'secondary_indexes', COALESCE((
+            SELECT json_agg(
+                json_build_object('name', index_relation.relname, 'def', pg_get_indexdef(index_data.indexrelid))
+                ORDER BY index_relation.relname
+            )
+            FROM pg_index AS index_data
+            JOIN pg_class AS index_relation ON index_relation.oid = index_data.indexrelid
+            WHERE index_data.indrelid = target.oid
+              AND NOT index_data.indisprimary
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_constraint AS constraint_data
+                  WHERE constraint_data.conindid = index_data.indexrelid
+              )
+        ), '[]'::json)
+    )
+), '{{}}'::json)::text
+FROM requested
+JOIN pg_class AS target
+  ON target.oid = to_regclass(
+      format('%I.%I', requested.schema_name, requested.table_name)
+  );
+""".strip()
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        output = self.run_remote_command(command, cancel_event=cancel_event).strip()
+        if not output:
+            return {}
+        try:
+            catalog = json.loads(output.splitlines()[-1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Could not inspect destination constraints for the expansion."
+            ) from exc
+        normalized = {}
+        for key, item in (catalog or {}).items():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("relation_kind") or "") not in ("r", "p"):
+                continue
+            normalized[int(key)] = item
+        return normalized
+
+    @staticmethod
+    def _bulk_load_applicable(constraint_catalog: dict, destination_row_counts: dict) -> bool:
+        """Bulk-load strategy applies only when every destination is empty."""
+        if not constraint_catalog:
+            return False
+        for item in constraint_catalog.values():
+            full_name = f"{item.get('schema_name')}.{item.get('table_name')}"
+            if int(destination_row_counts.get(full_name, -1)) != 0:
+                return False
+        return True
+
+    @staticmethod
+    def _build_constraint_teardown_sql(constraint_catalog: dict) -> str:
+        statements = []
+        for item in constraint_catalog.values():
+            schema = item["schema_name"]
+            table = item["table_name"]
+            for entry in item.get("foreign_keys") or []:
+                statements.append(
+                    f"ALTER TABLE {sql_ident(schema)}.{sql_ident(table)} "
+                    f"DROP CONSTRAINT {sql_ident(entry['name'])};"
+                )
+            for entry in item.get("unique_constraints") or []:
+                statements.append(
+                    f"ALTER TABLE {sql_ident(schema)}.{sql_ident(table)} "
+                    f"DROP CONSTRAINT {sql_ident(entry['name'])};"
+                )
+            for entry in item.get("secondary_indexes") or []:
+                statements.append(
+                    f"DROP INDEX IF EXISTS {sql_ident(schema)}.{sql_ident(entry['name'])};"
+                )
+        return "\n".join(statements)
+
+    @staticmethod
+    def _build_constraint_rebuild_sql(constraint_catalog: dict) -> str:
+        statements = []
+        for item in constraint_catalog.values():
+            schema = item["schema_name"]
+            table = item["table_name"]
+            for entry in item.get("secondary_indexes") or []:
+                definition = str(entry["def"]).strip().rstrip(";")
+                if not definition.lower().startswith("create"):
+                    continue
+                statements.append(definition + ";")
+            for entry in item.get("unique_constraints") or []:
+                definition = str(entry["def"]).strip().rstrip(";")
+                statements.append(
+                    f"ALTER TABLE {sql_ident(schema)}.{sql_ident(table)} "
+                    f"ADD CONSTRAINT {sql_ident(entry['name'])} {definition};"
+                )
+            for entry in item.get("foreign_keys") or []:
+                definition = str(entry["def"]).strip().rstrip(";")
+                statements.append(
+                    f"ALTER TABLE {sql_ident(schema)}.{sql_ident(table)} "
+                    f"ADD CONSTRAINT {sql_ident(entry['name'])} {definition} NOT VALID;"
+                )
+                statements.append(
+                    f"ALTER TABLE {sql_ident(schema)}.{sql_ident(table)} "
+                    f"VALIDATE CONSTRAINT {sql_ident(entry['name'])};"
+                )
+        return "\n".join(statements)
+
     @staticmethod
     def _build_expansion_manifest_sql(
         source_schema_name: str,
@@ -13813,6 +14006,7 @@ SELECT json_build_object(
             )
         source_schema_name = prepared["source_schema_name"]
         source_table_name = prepared["source_table_name"]
+        destination_row_counts: dict[str, int] = {}
 
         self._raise_if_cancelled(cancel_event)
         self._notify_progress(
@@ -13841,13 +14035,13 @@ SELECT json_build_object(
             "preflight",
             "Read and validate source column metadata",
         ):
+            source_column_definitions = self.get_table_column_definitions(
+                database_name,
+                source_full_table_name,
+                cancel_event=cancel_event,
+            )
             source_columns = {
-                item["name"]: item["type"]
-                for item in self.get_table_column_definitions(
-                    database_name,
-                    source_full_table_name,
-                    cancel_event=cancel_event,
-                )
+                item["name"]: item["type"] for item in source_column_definitions
             }
         missing_source_columns = [
             column_name
@@ -13929,7 +14123,7 @@ SELECT json_build_object(
                 "preflight",
                 f"Read row counter for {full_table_name}",
             ):
-                self.get_table_row_count(
+                destination_row_counts[full_table_name] = self.get_table_row_count(
                     database_name,
                     full_table_name,
                     cancel_event=cancel_event,
@@ -13957,6 +14151,43 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
+        fastpath_plan = None
+        staging_result = None
+        constraint_catalog: dict = {}
+        if self.expansion_fastpath_enabled:
+            with self.expansion_timing_scope(
+                timing_report,
+                "prepare",
+                "Plan optimized staging pipeline",
+            ):
+                try:
+                    fastpath_plan = plan_optimized_expansion(prepared, source_columns)
+                except Exception:  # noqa: BLE001 - classic path remains available
+                    fastpath_plan = None
+        if fastpath_plan is not None:
+            with self.expansion_timing_scope(
+                timing_report,
+                "prepare",
+                "Inspect destination constraints for bulk-load strategy",
+            ):
+                constraint_catalog = self._fetch_destination_constraint_catalog(
+                    database_name,
+                    prepared["destinations"],
+                    cancel_event=cancel_event,
+                )
+            if not self._bulk_load_applicable(
+                constraint_catalog, destination_row_counts
+            ):
+                # Non-empty destinations keep their per-row constraint checks.
+                constraint_catalog = {}
+            staging_result = run_staging_phase(
+                self,
+                fastpath_plan,
+                timing_report,
+                database_name,
+                cancel_event=cancel_event,
+            )
+
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -13964,14 +14195,24 @@ SELECT json_build_object(
         ):
             execution_statements = []
             timing_sequence = 10
-            for destination in prepared["destinations"]:
+            for plan_index, destination in enumerate(prepared["destinations"]):
+                destination["_plan_index"] = plan_index
                 for statement_index, statement in enumerate(
                     destination["statements"],
                     start=1,
                 ):
+                    if fastpath_plan is not None and staging_result is not None:
+                        executed_statement = self._resolve_optimized_statement(
+                            fastpath_plan,
+                            destination,
+                            statement_index,
+                            staging_result["partitions"],
+                        )
+                    else:
+                        executed_statement = statement
                     execution_statements.append(
                         self._build_managed_dml_sql(
-                            statement,
+                            executed_statement,
                             destination["schema_name"],
                             destination["pure_table_name"],
                             "add",
@@ -13987,14 +14228,39 @@ SELECT json_build_object(
                     )
                     timing_sequence += 1
 
-            manifest_sql = self._build_expansion_manifest_sql(
-                source_schema_name,
-                source_table_name,
-                prepared["raw_schemas"],
-            )
+            if fastpath_plan is not None and staging_result is not None:
+                manifest_sql = build_optimized_manifest_sql(
+                    fastpath_plan,
+                    staging_result["aggregates"],
+                    sql_literal(json.dumps(source_column_definitions)),
+                )
+            else:
+                manifest_sql = self._build_expansion_manifest_sql(
+                    source_schema_name,
+                    source_table_name,
+                    prepared["raw_schemas"],
+                )
             destination_lock_sql = self._build_cross_table_expansion_lock_sql(
                 prepared["destinations"]
             )
+            if (
+                fastpath_plan is not None
+                and staging_result is not None
+                and constraint_catalog
+            ):
+                constraint_teardown_sql = (
+                    self._build_constraint_teardown_sql(constraint_catalog)
+                )
+                constraint_rebuild_sql = (
+                    self._build_constraint_rebuild_sql(constraint_catalog)
+                )
+                staging_cleanup_sql = build_staging_cleanup_sql(
+                    staging_result["partitions"]
+                )
+            else:
+                constraint_teardown_sql = ""
+                constraint_rebuild_sql = ""
+                staging_cleanup_sql = ""
             timing_table_sql = """
 CREATE TEMP TABLE pgdm_expansion_timings (
     sequence_number integer PRIMARY KEY,
@@ -14028,13 +14294,51 @@ SELECT json_build_object(
 )::text
 FROM pg_temp.pgdm_expansion_timings;
 """.strip()
+            teardown_block = ""
+            if constraint_teardown_sql:
+                teardown_block = (
+                    "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                    "(5, 'execute', 'Teardown destination constraints for bulk load', "
+                    "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                    + constraint_teardown_sql
+                    + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                    "clock_timestamp() WHERE sequence_number = 5;"
+                )
+            rebuild_block = ""
+            if constraint_rebuild_sql:
+                rebuild_block = (
+                    "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                    "(500, 'execute', 'Rebuild and validate destination constraints', "
+                    "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                    + constraint_rebuild_sql
+                    + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                    "clock_timestamp() WHERE sequence_number = 500;"
+                )
+            cleanup_block = ""
+            if staging_cleanup_sql:
+                cleanup_block = (
+                    "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                    "(800, 'execute', 'Drop staging tables', "
+                    "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                    + staging_cleanup_sql
+                    + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                    "clock_timestamp() WHERE sequence_number = 800;"
+                )
+            session_tuning_sql = (
+                "SET LOCAL client_min_messages = warning;\n"
+                + "SET LOCAL synchronous_commit = off;\n"
+                + "SET LOCAL max_parallel_workers_per_gather = 0;\n"
+                + "SET LOCAL maintenance_work_mem = '128MB';\n"
+                if fastpath_plan is not None
+                else "SET LOCAL client_min_messages = warning;\n"
+            )
             wrapped_sql = (
                 timing_table_sql
                 + "\n\nBEGIN ISOLATION LEVEL REPEATABLE READ;\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(1, 'execute', 'Initialize database transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
-                + "SET LOCAL client_min_messages = warning;\n"
+                + session_tuning_sql
                 + "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 1;\n\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
@@ -14044,12 +14348,20 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 2;\n\n"
                 + "INSERT INTO pg_temp.pgdm_expansion_timings VALUES "
-                + "(3, 'execute', 'Scan source and build dependency manifest', "
+                + "(3, 'execute', "
+                + (
+                    "'Build dependency manifest from staging aggregates', "
+                    if fastpath_plan is not None
+                    else "'Scan source and build dependency manifest', "
+                )
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
                 + manifest_sql
                 + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                 + "clock_timestamp() WHERE sequence_number = 3;\n\n"
+                + teardown_block
                 + "\n\n".join(execution_statements)
+                + rebuild_block
+                + cleanup_block
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
@@ -14064,6 +14376,12 @@ FROM pg_temp.pgdm_expansion_timings;
             f"-d {shlex.quote(database_name)} "
             "-X -qAt -v ON_ERROR_STOP=1 -f -"
         )
+        dump_path = os.getenv("PDM_EXPANSION_DUMP_SQL")
+        if dump_path:
+            try:
+                Path(dump_path).write_text(wrapped_sql, encoding="utf-8")
+            except OSError:
+                pass
         self._notify_progress(
             progress_callback,
             "execute",
