@@ -2,7 +2,7 @@
 
 **Author:** bcap52 (Kaggle)
 **Repository:** https://github.com/bcap52/kaggle_postgre_challenge
-**Submission commit:** _final commit hash, filled in at submission_
+**Submission commit:** pinned in the Kaggle Writeup (final commit of this repository)
 
 ---
 
