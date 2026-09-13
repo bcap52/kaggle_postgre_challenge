@@ -94,6 +94,7 @@ Numbers are MEASURED PROCESSING TOTAL medians of three runs
 |----------|-------------------:|----------:|---------:|
 | 100k     |          10.0 s    |  5.3 s    |   1.9×   |
 | 1M       |         129.3 s    | 36.3 s    |   3.6×   |
+| 10M      |       1313.3 s     | 383.0 s   |   3.4×   |
 
 Staging storage is transient (unlogged, dropped inside the measured
 transaction): ≈16 MB per 100k source rows (≈8–12× smaller than the JSONB

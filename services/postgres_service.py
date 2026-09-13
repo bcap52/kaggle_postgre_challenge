@@ -14394,15 +14394,41 @@ SELECT json_build_object(
             if job_manager is not None:
                 if resumable is not None:
                     job_manager.cleanup_orphaned_staging(resumable["job_id"])
-            staging_result = run_staging_phase(
-                self,
-                fastpath_plan,
-                timing_report,
-                database_name,
-                cancel_event=cancel_event,
-                job_manager=job_manager,
-                job=resumable if (resumable is not None and resumable.get("status") in ("staging", "writing")) else None,
-            )
+            staging_job = resumable if (
+                resumable is not None
+                and resumable.get("status") in ("staging", "writing")
+            ) else None
+            try:
+                staging_result = run_staging_phase(
+                    self,
+                    fastpath_plan,
+                    timing_report,
+                    database_name,
+                    cancel_event=cancel_event,
+                    job_manager=job_manager,
+                    job=staging_job,
+                )
+            except Exception:
+                # A restrictive sshd MaxSessions or a transient worker failure
+                # must not break the expansion: retry with a single session.
+                if staging_job is None:
+                    with self.expansion_timing_scope(
+                        timing_report,
+                        "staging",
+                        "Retrying staging extraction with a single session",
+                    ):
+                        staging_result = run_staging_phase(
+                            self,
+                            fastpath_plan,
+                            timing_report,
+                            database_name,
+                            cancel_event=cancel_event,
+                            job_manager=job_manager,
+                            job=None,
+                            single_worker=True,
+                        )
+                else:
+                    raise
             if job_manager is not None and staging_result.get("job") is not None:
                 job_manager.cleanup_orphaned_staging(
                     staging_result["job"]["job_id"]

@@ -89,7 +89,7 @@ PROCESSING TOTAL, median of 3 runs (full reports in `benchmarks/reports/`).
 |---|---:|---:|---:|
 | 100k | 10.0 s | 5.3 s | 1.9× |
 | 1M | 129.3 s | 36.3 s | 3.6× |
-| 10M | _pending local run_ | _pending_ | — |
+| 10M | 1313.3 s | 383.0 s | 3.4× |
 
 Exported reports: `benchmarks/reports/*.txt`.
 

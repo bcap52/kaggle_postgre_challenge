@@ -378,8 +378,8 @@ def _rewrite_lateral_typed_flow(
         column_names = [
             column.strip() for column in alias_match.group("cols").split(",")
         ]
-        if len(column_names) != len(rows[0].split(",")) if rows else True:
-            pass  # verified per-column below
+        if not rows:
+            continue
         row_entries = [
             [entry.strip() for entry in _split_top_level(row)] for row in rows
         ]
@@ -698,6 +698,7 @@ def run_staging_phase(
     worker_count: int | None = None,
     job_manager=None,
     job: dict | None = None,
+    single_worker: bool = False,
 ) -> dict:
     """Build (or resume) the staging partitions in parallel sessions.
 
@@ -706,6 +707,9 @@ def run_staging_phase(
     partitions are re-extracted, and every finished worker is checkpointed
     as soon as it completes.
     """
+    if single_worker:
+        worker_count = 1
+
     if worker_count is None:
         worker_count = default_worker_count()
 
