@@ -17,6 +17,11 @@ import sys
 import time
 from pathlib import Path
 
+def _env(name: str, default: str = "") -> str:
+    """Benchmark connection settings come from the environment."""
+    return os.getenv(name, default)
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -126,9 +131,9 @@ def version_count(service, job_id):
 def main() -> int:
     service = PostgresAdminService()
     service.connect(
-        host="localhost", ssh_port=2222, ssh_username="kaggleuser",
-        ssh_password="kaggle_dev_2026", postgres_port=5432,
-        sql_username="kaggle", sql_password="kaggle_dev_2026",
+        host="localhost", ssh_port=2222, ssh_username=_env("PDM_BENCH_SSH_USER", "kaggleuser"),
+        ssh_password=_env("PDM_BENCH_PASSWORD", ""), postgres_port=5432,
+        sql_username=_env("PDM_BENCH_PG_USER", "kaggle"), sql_password=_env("PDM_BENCH_PASSWORD", ""),
     )
     failures = []
     try:

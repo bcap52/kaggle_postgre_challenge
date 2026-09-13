@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+def _env(name: str, default: str = "") -> str:
+    """Benchmark connection settings come from the environment."""
+    return os.getenv(name, default)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -149,11 +155,11 @@ def main() -> int:
     parser.add_argument("--rows-label", default="100k")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--ssh-port", type=int, default=2222)
-    parser.add_argument("--ssh-user", default="kaggleuser")
-    parser.add_argument("--ssh-password", default="kaggle_dev_2026")
+    parser.add_argument("--ssh-user", default=_env("PDM_BENCH_SSH_USER", "kaggleuser"))
+    parser.add_argument("--ssh-password", default=_env("PDM_BENCH_PASSWORD", ""))
     parser.add_argument("--postgres-port", type=int, default=5432)
-    parser.add_argument("--pg-user", default="kaggle")
-    parser.add_argument("--pg-password", default="kaggle_dev_2026")
+    parser.add_argument("--pg-user", default=_env("PDM_BENCH_PG_USER", "kaggle"))
+    parser.add_argument("--pg-password", default=_env("PDM_BENCH_PASSWORD", ""))
     parser.add_argument("--database", default="kaggle_challenge")
     parser.add_argument("--source", default="public.raw_data")
     parser.add_argument("--raw-schemas", nargs="+", default=["group001"])
