@@ -18,6 +18,7 @@ from pathlib import Path
 import paramiko
 
 from services.expansion_optimizer import (
+    ExpansionJobManager,
     OptimizedExpansionPlan,
     build_optimized_manifest_sql,
     build_staging_cleanup_sql,
@@ -13788,6 +13789,15 @@ FROM requested;
             payload_sql = payload_sql.strip().rstrip(";").strip()
             destination_blocks.append(
                 f"""
+INSERT INTO {DATA_TABLE_ROW_COUNTS} (schema_name, table_name, row_count)
+SELECT {sql_literal(schema_name)}, {sql_literal(table_name)}, (SELECT COUNT(*) FROM {sql_ident(schema_name)}.{sql_ident(table_name)})
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM {DATA_TABLE_ROW_COUNTS}
+    WHERE schema_name = {sql_literal(schema_name)}
+      AND table_name = {sql_literal(table_name)}
+);
+
 SELECT json_build_object(
     'preflight', 'destination',
     'index', {index},
@@ -14295,13 +14305,111 @@ SELECT json_build_object(
             ):
                 # Non-empty destinations keep their per-row constraint checks.
                 constraint_catalog = {}
+            job_manager = ExpansionJobManager(self, database_name)
+            resumable = None
+            resumable_job_id = None
+            with self.expansion_timing_scope(
+                timing_report,
+                "prepare",
+                "Prepare resumable expansion job checkpoint",
+            ):
+                try:
+                    job_manager.ensure_tables()
+                    resumable = job_manager.find_resumable_job(
+                        fastpath_plan.source_schema,
+                        fastpath_plan.source_table,
+                        fastpath_plan.recipes_hash,
+                    )
+                    if resumable is not None:
+                        resume_mode = (
+                            os.getenv("PDM_EXPANSION_RESUME_MODE", "auto")
+                            .strip()
+                            .lower()
+                        )
+                        if resume_mode == "fresh":
+                            resumable = None
+                    if resumable is not None:
+                        resumable_job_id = resumable["job_id"]
+                        job_manager.abandon_stale_jobs(
+                            fastpath_plan.source_schema,
+                            fastpath_plan.source_table,
+                            resumable_job_id,
+                        )
+                except Exception:  # noqa: BLE001 - recovery is best-effort
+                    job_manager = None
+                    job = None
+                    resumable_job_id = None
+            if (
+                job_manager is not None
+                and resumable is not None
+                and resumable.get("status") == "data_committed"
+            ):
+                # The destination rows were committed atomically with the
+                # checkpoint; only version registration remains.
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "staging",
+                    "Detected committed-but-unregistered expansion; recovering",
+                ):
+                    stored_manifest = job_manager.load_job_manifest(
+                        resumable["job_id"]
+                    )
+                if stored_manifest is None:
+                    raise RuntimeError(
+                        "The interrupted job was marked data-committed but its "
+                        "dependency manifest is missing; run a fresh expansion."
+                    )
+                result = {
+                    "source_database_name": database_name,
+                    "source_schema_name": source_schema_name,
+                    "source_table_name": source_table_name,
+                    "raw_schemas": list(prepared["raw_schemas"]),
+                    "source_versions": source_versions,
+                    "dependency_manifest": stored_manifest,
+                    "destinations": prepared["destinations"],
+                    "timing_report": timing_report,
+                    "expansion_job_id": resumable["job_id"],
+                }
+                timing_report["source_rows"] = int(
+                    stored_manifest.get("expected_row_count") or 0
+                )
+                self._notify_progress(
+                    progress_callback,
+                    "execute",
+                    100,
+                    "Recovered committed expansion; completing versioning.",
+                )
+                return result
+            if (
+                job_manager is not None
+                and resumable is not None
+                and resumable.get("status") in ("staging", "writing")
+            ):
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "staging",
+                    "Validate staging checkpoints of interrupted job",
+                ):
+                    job_manager.validate_staged_partitions(resumable)
+            if job_manager is not None:
+                if resumable is not None:
+                    job_manager.cleanup_orphaned_staging(resumable["job_id"])
             staging_result = run_staging_phase(
                 self,
                 fastpath_plan,
                 timing_report,
                 database_name,
                 cancel_event=cancel_event,
+                job_manager=job_manager,
+                job=resumable if (resumable is not None and resumable.get("status") in ("staging", "writing")) else None,
             )
+            if job_manager is not None and staging_result.get("job") is not None:
+                job_manager.cleanup_orphaned_staging(
+                    staging_result["job"]["job_id"]
+                )
+            job = staging_result.get("job")
+            if job_manager is not None and job is not None:
+                job_manager.mark_status(job["job_id"], "writing")
 
         with self.expansion_timing_scope(
             timing_report,
@@ -14409,6 +14517,26 @@ SELECT json_build_object(
 )::text
 FROM pg_temp.pgdm_expansion_timings;
 """.strip()
+            _checkpoint_manifest_payload = {
+                "raw_schemas": prepared["raw_schemas"],
+                "expected_row_count": (
+                    sum(
+                        int(entry.get("row_count") or 0)
+                        for aggregate in (staging_result["aggregates"] if staging_result else [])
+                        for entry in (aggregate.get("manifest") or [])
+                    )
+                    if staging_result
+                    else 0
+                ),
+                "raw_hash_manifest": [
+                    entry
+                    for aggregate in (staging_result["aggregates"] if staging_result else [])
+                    for entry in (aggregate.get("manifest") or [])
+                ],
+                "expansion_job_id": (
+                    staging_result["job"]["job_id"] if staging_result and staging_result.get("job") else None
+                ),
+            }
             teardown_block = ""
             if constraint_teardown_sql:
                 teardown_block = (
@@ -14438,6 +14566,19 @@ FROM pg_temp.pgdm_expansion_timings;
                     + staging_cleanup_sql
                     + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
                     "clock_timestamp() WHERE sequence_number = 800;"
+                )
+            commit_checkpoint_block = ""
+            if fastpath_plan is not None and staging_result is not None and staging_result.get("job"):
+                commit_checkpoint_block = (
+                    "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
+                    "(850, 'execute', 'Mark expansion job data-committed (checkpoint)', "
+                    "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
+                    + job_manager.mark_job_data_committed_sql(
+                        staging_result["job"]["job_id"],
+                        json.dumps(_checkpoint_manifest_payload),
+                    )
+                    + "\nUPDATE pg_temp.pgdm_expansion_timings SET finished_at = "
+                    "clock_timestamp() WHERE sequence_number = 850;"
                 )
             session_tuning_sql = (
                 "SET LOCAL client_min_messages = warning;\n"
@@ -14477,6 +14618,7 @@ FROM pg_temp.pgdm_expansion_timings;
                 + "\n\n".join(execution_statements)
                 + rebuild_block
                 + cleanup_block
+                + commit_checkpoint_block
                 + "\n\nINSERT INTO pg_temp.pgdm_expansion_timings VALUES "
                 + "(9000, 'execute', 'Commit expansion transaction', "
                 + "clock_timestamp(), NULL, NULL, NULL, NULL);\n"
@@ -14605,6 +14747,15 @@ FROM pg_temp.pgdm_expansion_timings;
             "dependency_manifest": manifest,
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
+            "expansion_job_id": (
+                staging_result["job"]["job_id"]
+                if (
+                    fastpath_plan is not None
+                    and staging_result is not None
+                    and staging_result.get("job")
+                )
+                else None
+            ),
         }
 
     def execute_sql_script(
@@ -15380,6 +15531,91 @@ COMMIT;
             ]
         )
 
+    def _run_control_query_text(
+        self,
+        sql: str,
+        cancel_event=None,
+        timing_report: dict | None = None,
+        timing_stage: str | None = None,
+        timing_name: str | None = None,
+    ) -> str:
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(CONTROL_DB)} -X -qAt -v ON_ERROR_STOP=1 "
+            f"-c {shlex.quote(sql)}"
+        )
+        if timing_report is not None and timing_stage and timing_name:
+            with self.expansion_timing_scope(
+                timing_report,
+                timing_stage,
+                timing_name,
+            ):
+                return self.run_remote_command(
+                    command, cancel_event=cancel_event
+                )
+        return self.run_remote_command(command, cancel_event=cancel_event)
+
+    def _registered_versions_for_job(
+        self, expansion_job_id: str, table_names
+    ) -> list[dict]:
+        normalized = [
+            str(table_name or "").strip()
+            for table_name in table_names or []
+            if str(table_name or "").strip()
+        ]
+        if not normalized:
+            return []
+        conditions = " OR ".join(
+            "dependency_payload->>'expansion_job_id' = "
+            + sql_literal(expansion_job_id)
+            for _table in normalized
+        )
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'table_name', versions.schema_name || '.' || versions.table_name,
+    'version_code', versions.version_code
+))::text, '[]'::text)
+FROM {CONTROL_TABLE_VERSION_DEPENDENCIES} AS dependencies
+JOIN {CONTROL_TABLE_VERSIONS} AS versions
+  ON versions.id = dependencies.table_version_id
+WHERE ({conditions});
+"""
+        output = self._run_control_query_text(sql)
+        try:
+            return list(json.loads(
+                output.splitlines()[-1] if output else "[]"
+            ))
+        except (json.JSONDecodeError, IndexError):
+            return []
+
+    def _mark_expansion_job_complete(
+        self, expansion_job_id: str, database_name: str | None = None
+    ) -> None:
+        if not expansion_job_id:
+            return
+        candidates = [database_name] if database_name else []
+        candidates += [
+            name for name in self._data_metadata_ready_databases
+            if name not in candidates
+        ]
+        for candidate in candidates:
+            try:
+                command = (
+                    f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                    f"-d {shlex.quote(candidate)} -X -qAt "
+                    f"-v ON_ERROR_STOP=1 -c "
+                    + shlex.quote(
+                        "UPDATE pgdm_expansion_control.expansion_jobs "
+                        "SET status = 'complete', updated_at = clock_timestamp() "
+                        "WHERE job_id = "
+                        + sql_literal(expansion_job_id)
+                        + " AND status = 'data_committed';"
+                    )
+                )
+                self.run_remote_command(command)
+            except Exception:  # noqa: BLE001 - completion marking is best-effort
+                pass
+
     def register_cross_table_expansion_versions(
         self,
         expansion_result: dict,
@@ -15416,6 +15652,9 @@ COMMIT;
         base_manifest = dict(
             (expansion_result or {}).get("dependency_manifest") or {}
         )
+        expansion_job_id = str(
+            (expansion_result or {}).get("expansion_job_id") or ""
+        ).strip() or None
         if not database_name or not source_schema_name or not source_table_name:
             raise RuntimeError("The expansion result does not identify its source.")
         if not raw_schemas or not destinations or not base_manifest:
@@ -15440,6 +15679,41 @@ COMMIT;
             5,
             "Preparing atomic destination version registration...",
         )
+        if expansion_job_id:
+            existing_sql = (
+                "SELECT EXISTS ("
+                "SELECT 1 FROM "
+                + CONTROL_TABLE_VERSION_DEPENDENCIES
+                + " WHERE dependency_payload->>'expansion_job_id' = "
+                + sql_literal(expansion_job_id)
+                + ")::text;"
+            )
+            existing_output = self._run_control_query_text(
+                existing_sql,
+                cancel_event=cancel_event,
+                timing_report=timing_report,
+                timing_stage="version",
+                timing_name="Check expansion job registration state",
+            )
+            if str(existing_output).strip().lower() == "true":
+                already = self._registered_versions_for_job(
+                    expansion_job_id,
+                    [
+                        destination.get("table_name")
+                        for destination in destinations
+                    ],
+                )
+                self._mark_expansion_job_complete(expansion_job_id, database_name)
+                self._notify_progress(
+                    progress_callback,
+                    "version",
+                    100,
+                    "Versions were already registered for this job; "
+                    "registration skipped.",
+                )
+                return already
+        if expansion_job_id:
+            base_manifest["expansion_job_id"] = expansion_job_id
         sql_parts = [
             """
 CREATE TEMP TABLE pgdm_expansion_timings (
@@ -15789,6 +16063,8 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
             100,
             f"{len(registered)} version(s) registered atomically.",
         )
+        if expansion_job_id:
+            self._mark_expansion_job_complete(expansion_job_id, database_name)
         return [
             registered_by_table[table_name]
             for table_name in normalized_destinations

@@ -2,13 +2,18 @@
 
 Runs the expansion twice on the freshly reset challenge database - once with
 the classic path (PDM_EXPANSION_FASTPATH=0) and once with the fast path - and
-compares the full contents of all six destination tables, the Manager row
+compares the logical content of all six destination tables, the Manager row
 counters, and the registered version metadata.
+
+Surrogate identity columns (``id_column_1``) are excluded from the comparison
+because their values depend on the execution plan's join strategy.  Foreign
+key references are translated to logical keys (``raw_id`` for table1
+references, natural dimension keys for table3/table4 references).  The
+comparison therefore verifies the relational content the recipes define,
+independent of surrogate assignment.
 """
 from __future__ import annotations
 
-import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -29,40 +34,75 @@ DESTINATIONS = [
     "public.table6",
 ]
 
+_DIGEST = (
+    "SELECT COALESCE(MD5(string_agg(row_md5, E'\n' ORDER BY row_md5)), 'empty') "
+    "FROM (SELECT MD5(ROW_TO_JSON(t)::text) AS row_md5 FROM ({inner}) t) s;"
+)
+
+LOGICAL_DIGEST_SQL = {
+    # table3/table4: natural keys only (identity surrogate excluded).
+    "public.table3": (
+        "SELECT text_column_1, text_column_2, numeric_column_1, "
+        "text_column_3, text_column_4 FROM public.table3"
+    ),
+    "public.table4": (
+        "SELECT id_column_1, text_column_1, text_column_2 FROM public.table4"
+    ),
+    # table1: keyed by raw_id; FK to table3 translated to its natural key.
+    "public.table1": (
+        "SELECT t.id_column_3 AS raw_id, t.id_column_2, t.datetime_column_1, "
+        "t.integer_column_1, t.integer_column_2, t.integer_column_3, "
+        "t.integer_column_4, t.integer_column_5, t.id_column_6, "
+        "t.integer_column_6, t.integer_column_7, "
+        "d.text_column_1 AS d_text_1, d.text_column_2 AS d_text_2, "
+        "d.text_column_3 AS d_text_3, d.text_column_4 AS d_text_4, "
+        "d.numeric_column_1 AS d_num_1 "
+        "FROM public.table1 t LEFT JOIN public.table3 d "
+        "ON d.id_column_1 = t.id_column_4"
+    ),
+    "public.table5": (
+        "SELECT m.id_column_3 AS raw_id, s.numeric_column_1, "
+        "s.numeric_column_2, s.integer_column_1, s.integer_column_2, "
+        "s.id_column_3 FROM public.table5 s "
+        "JOIN public.table1 m ON m.id_column_1 = s.id_column_2"
+    ),
+    # table6: keyed through table1.raw_id; table4 FK is its natural smallint key.
+    "public.table6": (
+        "SELECT m.id_column_3 AS raw_id, s.id_column_3 "
+        "FROM public.table6 s JOIN public.table1 m "
+        "ON m.id_column_1 = s.id_column_2"
+    ),
+    # table2: keyed through table1.raw_id.
+    "public.table2": (
+        "SELECT m.id_column_3 AS raw_id, s.integer_column_1, "
+        "s.integer_column_2, s.text_column_1, s.integer_column_3, "
+        "s.integer_column_4, s.integer_column_5, s.integer_column_6 "
+        "FROM public.table2 s JOIN public.table1 m "
+        "ON m.id_column_1 = s.id_column_2"
+    ),
+}
+
 
 def dump_destinations(service: PostgresAdminService) -> dict:
-    """Order-independent content digest + row counts for every destination."""
-    output = {}
-    for table in DESTINATIONS:
-        columns_sql = (
-            "SELECT string_agg(quote_ident(attribute.attname), ', ' ORDER BY attribute.attnum) "
-            "FROM pg_attribute AS attribute "
-            "JOIN pg_class AS relation ON relation.oid = attribute.attrelid "
-            "JOIN pg_namespace AS ns ON ns.oid = relation.relnamespace "
-            f"WHERE ns.nspname || '.' || relation.relname = '{table.split('.')[-1]}' "
-            "AND ns.nspname = 'public' AND attribute.attnum > 0 AND NOT attribute.attisdropped"
-        )
-        command = (
-            f"psql -h localhost -U {service.sql_username} -d kaggle_challenge "
-            "-X -qAt -v ON_ERROR_STOP=1"
-        )
-        columns = service.run_remote_command(command, stdin_text=columns_sql).strip()
-        digest_sql = (
-            "SELECT COALESCE(MD5(string_agg(row_md5, E'\\n' ORDER BY row_md5)), 'empty') FROM ("
-            f"SELECT MD5(ROW_TO_JSON(t)::text) AS row_md5 FROM (SELECT {columns} FROM {table}) t"
-            ") s;"
-        )
-        digest = service.run_remote_command(command, stdin_text=digest_sql).strip()
-        count_sql = f"SELECT COUNT(*) FROM {table};"
-        count = service.run_remote_command(command, stdin_text=count_sql).strip()
-        output[table] = {"rows": int(count), "content_md5": digest}
-    counters_sql = (
-        "SELECT json_object_agg(schema_name || '.' || table_name, row_count)::text "
-        "FROM public.pgdm_table_row_counts;"
-    )
+    """Logical content digest + row counts for every destination."""
     command = (
         f"psql -h localhost -U {service.sql_username} -d kaggle_challenge "
         "-X -qAt -v ON_ERROR_STOP=1"
+    )
+
+    def digest(sql: str) -> str:
+        return service.run_remote_command(command, stdin_text=sql).strip()
+
+    output = {}
+    for table in DESTINATIONS:
+        digest_sql = _DIGEST.format(inner=LOGICAL_DIGEST_SQL[table])
+        output[table] = {
+            "rows": int(digest(f"SELECT COUNT(*) FROM {table};")),
+            "content_md5": digest(digest_sql),
+        }
+    counters_sql = (
+        "SELECT json_object_agg(schema_name || '.' || table_name, row_count)::text "
+        "FROM public.pgdm_table_row_counts;"
     )
     output["row_counters"] = json.loads(
         service.run_remote_command(command, stdin_text=counters_sql).strip()
@@ -72,7 +112,7 @@ def dump_destinations(service: PostgresAdminService) -> dict:
 
 def dump_versions(service: PostgresAdminService) -> dict:
     command = (
-        f"psql -h localhost -U {service.sql_username} -d {service and 'postgres_data_manager'} "
+        f"psql -h localhost -U {service.sql_username} -d postgres_data_manager "
         "-X -qAt -v ON_ERROR_STOP=1"
     )
     sql = (
@@ -117,25 +157,11 @@ def run_expansion(mode: str, label: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--ssh-port", type=int, default=2222)
-    parser.add_argument("--ssh-user", default="kaggleuser")
-    parser.add_argument("--ssh-password", default="kaggle_dev_2026")
-    parser.add_argument("--postgres-port", type=int, default=5432)
-    parser.add_argument("--pg-user", default="kaggle")
-    parser.add_argument("--pg-password", default="kaggle_dev_2026")
-    args = parser.parse_args()
-
     service = PostgresAdminService()
     service.connect(
-        host=args.host,
-        ssh_port=args.ssh_port,
-        ssh_username=args.ssh_user,
-        ssh_password=args.ssh_password,
-        postgres_port=args.postgres_port,
-        sql_username=args.pg_user,
-        sql_password=args.pg_password,
+        host="localhost", ssh_port=2222, ssh_username="kaggleuser",
+        ssh_password="kaggle_dev_2026", postgres_port=5432,
+        sql_username="kaggle", sql_password="kaggle_dev_2026",
     )
     try:
         print("Running classic expansion...")
@@ -157,15 +183,15 @@ def main() -> int:
                 + ("IDENTICAL" if same else "MISMATCH")
             )
             if not same:
-                print(f"    classic: {classic[table]}")
+                print(f"    classic:  {classic[table]}")
                 print(f"    fastpath: {fastpath[table]}")
         counters_ok = classic["row_counters"] == fastpath["row_counters"]
         all_ok &= counters_ok
         print("  row counters: " + ("IDENTICAL" if counters_ok else "MISMATCH"))
         versions_ok = classic_versions == fastpath_versions
         print("  version registration: " + ("IDENTICAL" if versions_ok else "MISMATCH"))
-        print("RESULT:", "PASS" if all_ok and counters_ok else "FAIL")
-        return 0 if all_ok and counters_ok else 1
+        print("RESULT:", "PASS" if all_ok and counters_ok and versions_ok else "FAIL")
+        return 0 if all_ok and counters_ok and versions_ok else 1
     finally:
         service.close()
 
